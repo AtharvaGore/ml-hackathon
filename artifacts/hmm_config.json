@@ -1,0 +1,9 @@
+{
+  "sigma_z": 7.5,
+  "beta": 7.0,
+  "search_radius": 50.0,
+  "max_candidates": 10,
+  "disconnected_penalty": -35.0,
+  "max_speed_ms": 45.0,
+  "model_weight": 0.5
+}

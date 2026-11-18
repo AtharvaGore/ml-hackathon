@@ -1,0 +1,10 @@
+{
+  "mean_top1_classifier": 0.5409688840381095,
+  "mean_top1_viterbi": 0.8763038956849123,
+  "mean_top1_improvement": 0.33533501164680285,
+  "mean_continuity_classifier": 0.8066647356861377,
+  "mean_continuity_viterbi": 0.9746738066973262,
+  "mean_continuity_improvement": 0.1680090710111884,
+  "mean_candidate_miss_rate": 0.0349196920197911,
+  "mean_inference_time_sec": 0.1755131721496582
+}
