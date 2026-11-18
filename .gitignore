@@ -1,7 +1,7 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
-*$py.class
+*.class
 *.so
 .Python
 
@@ -55,3 +55,9 @@ Thumbs.db
 artifacts/*.parquet
 exports/
 *.log
+
+# Generated model artifacts and experiment outputs
+artifacts/*.pkl
+artifacts/training_dataset.csv
+experiments/*.csv
+experiments/*.npz
