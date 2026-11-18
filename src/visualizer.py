@@ -1,10 +1,11 @@
 """Interactive Folium map generator for GPS map-matching visualization (Member 4).
 
-Renders four core layers plus an optional discrepancy overlay:
+Renders four core layers plus an optional diagnostics overlay — optimized for real
+multi-thousand-point trajectories and city-scale road graphs:
   1. Raw GPS observations (blue circle markers)
-  2. Road network arcs (light gray lines)
-  3. Ground-truth reference route (green line)
-  4. Model predicted reconstructed route (purple/red line)
+  2. Road network arcs (light gray GeoJSON lines)
+  3. Ground-truth reference route (green merged polylines)
+  4. Model predicted reconstructed route (purple dashed merged polylines)
 """
 
 from __future__ import annotations
@@ -37,7 +38,39 @@ SUPPORTED_TILES = {
 }
 
 
-def _build_legend_html(trip_id: str, metrics: Mapping[str, Any] | None = None) -> str:
+def _merge_contiguous_polylines(arcs: Sequence[Mapping[str, Any]]) -> list[list[list[float]]]:
+    """Merge chained road arcs into smooth continuous polylines for fast Leaflet rendering."""
+    chains: list[list[list[float]]] = []
+    current_chain: list[list[float]] = []
+
+    for arc in arcs:
+        coords = arc.get("coords", [])
+        if len(coords) < 2:
+            continue
+        p0 = [float(coords[0][0]), float(coords[0][1])]
+        p1 = [float(coords[-1][0]), float(coords[-1][1])]
+
+        if not current_chain:
+            current_chain = [p0, p1]
+        else:
+            last = current_chain[-1]
+            # Connect seamlessly if endpoints match within ~1e-6 deg (~0.1m)
+            if abs(last[0] - p0[0]) < 1e-6 and abs(last[1] - p0[1]) < 1e-6:
+                current_chain.append(p1)
+            else:
+                chains.append(current_chain)
+                current_chain = [p0, p1]
+
+    if current_chain:
+        chains.append(current_chain)
+    return chains
+
+
+def _build_legend_html(
+    trip_id: str,
+    metrics: Mapping[str, Any] | None = None,
+    gps_note: str = "",
+) -> str:
     """Create a clean floating HTML legend box for the Folium map."""
     metrics_block = ""
     if metrics:
@@ -59,6 +92,12 @@ def _build_legend_html(trip_id: str, metrics: Mapping[str, Any] | None = None) -
                 + "</div>"
             )
 
+    note_block = (
+        f"<div style='margin-top:4px;font-size:10.5px;color:#64748B;'>{gps_note}</div>"
+        if gps_note
+        else ""
+    )
+
     return f"""
     <div style="
         position: fixed;
@@ -73,7 +112,7 @@ def _build_legend_html(trip_id: str, metrics: Mapping[str, Any] | None = None) -
         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
         font-size: 12px;
         color: #0F172A;
-        min-width: 225px;
+        min-width: 235px;
     ">
       <div style="font-weight: 700; font-size: 13px; margin-bottom: 6px;">
         Trip: {trip_id}
@@ -104,6 +143,7 @@ def _build_legend_html(trip_id: str, metrics: Mapping[str, Any] | None = None) -
         <span>Mismatched Observations</span>
       </div>
       {metrics_block}
+      {note_block}
     </div>
     """
 
@@ -142,22 +182,9 @@ def create_trip_map_from_payload(
     payload: Mapping[str, Any],
     tiles: str = "OpenStreetMap",
     show_layers: Mapping[str, bool] | None = None,
+    max_gps_markers: int = 380,
 ) -> folium.Map:
-    """Build an interactive 4-layer Folium map from a `/predict_trip` JSON payload.
-
-    Parameters
-    ----------
-    payload:
-        Dictionary returned by ``POST /predict_trip`` containing ``trip_id``,
-        ``gps_points``, ``road_network_arcs``, ``ground_truth_arcs``,
-        ``predicted_arcs``, and optionally ``step_details`` and ``metrics``.
-    tiles:
-        Folium tile layer name.
-    show_layers:
-        Optional dict controlling initial visibility of layers:
-        ``{"gps": True, "road_network": True, "ground_truth": True,
-        "predicted": True, "mismatches": True}``.
-    """
+    """Build an interactive 4-layer Folium map from a `/predict_trip` JSON payload."""
     trip_id = str(payload.get("trip_id", "unknown_trip"))
     gps_points: Sequence[Mapping[str, Any]] = payload.get("gps_points", [])
     road_arcs: Sequence[Mapping[str, Any]] = payload.get("road_network_arcs", [])
@@ -181,83 +208,88 @@ def create_trip_map_from_payload(
 
     map_kwargs: dict[str, Any] = {
         "location": center,
-        "zoom_start": 15,
+        "zoom_start": 14,
         "tiles": tile_spec,
         "control_scale": True,
+        "prefer_canvas": True,
     }
     if tile_attr:
         map_kwargs["attr"] = tile_attr
     fmap = folium.Map(**map_kwargs)
 
-    # Layer 2: Road Network Arcs (drawn first so routes sit cleanly on top)
+    # Layer 2: Road Network Arcs rendered via fast GeoJSON FeatureCollection
     road_layer = folium.FeatureGroup(
         name="Layer 2: Road Network Arcs",
         show=visibility["road_network"],
     )
-    for arc in road_arcs:
-        coords = arc.get("coords", [])
-        if len(coords) < 2:
-            continue
-        arc_id = arc.get("arc_id", "?")
-        length_m = arc.get("length", 0.0)
-        from_n = arc.get("from_node", "?")
-        to_n = arc.get("to_node", "?")
-        folium.PolyLine(
-            locations=coords,
-            color=LAYER_COLORS["road_network"],
-            weight=2.0,
-            opacity=0.6,
-            tooltip=f"Road Arc #{arc_id} ({from_n} -> {to_n}, {float(length_m):.1f}m)",
-        ).add_to(road_layer)
+    if road_arcs:
+        features = []
+        for arc in road_arcs:
+            coords = arc.get("coords", [])
+            if len(coords) < 2:
+                continue
+            # GeoJSON uses [lon, lat] order
+            features.append(
+                {
+                    "type": "Feature",
+                    "geometry": {
+                        "type": "LineString",
+                        "coordinates": [[float(c[1]), float(c[0])] for c in coords],
+                    },
+                    "properties": {
+                        "arc_id": arc.get("arc_id", -1),
+                        "length": arc.get("length", 0.0),
+                    },
+                }
+            )
+        if features:
+            folium.GeoJson(
+                {"type": "FeatureCollection", "features": features},
+                style_function=lambda _feat: {
+                    "color": LAYER_COLORS["road_network"],
+                    "weight": 1.8,
+                    "opacity": 0.55,
+                },
+            ).add_to(road_layer)
     road_layer.add_to(fmap)
 
-    # Layer 3: Ground-Truth Reference Route (Green line)
+    # Layer 3: Ground-Truth Reference Route (Green merged polylines)
     gt_layer = folium.FeatureGroup(
         name="Layer 3: Ground-Truth Route (Green)",
         show=visibility["ground_truth"],
     )
-    for idx, arc in enumerate(gt_arcs):
-        coords = arc.get("coords", [])
-        if len(coords) < 2:
-            continue
-        arc_id = arc.get("arc_id", "?")
-        length_m = arc.get("length", 0.0)
+    for chain_idx, chain in enumerate(_merge_contiguous_polylines(gt_arcs), start=1):
         folium.PolyLine(
-            locations=coords,
+            locations=chain,
             color=LAYER_COLORS["ground_truth"],
             weight=6.5,
             opacity=0.82,
-            tooltip=f"Ground Truth [{idx + 1}] | Arc #{arc_id} ({float(length_m):.1f}m)",
+            tooltip=f"Ground-Truth Route Segment #{chain_idx} ({len(gt_arcs)} total arcs)",
         ).add_to(gt_layer)
     gt_layer.add_to(fmap)
 
-    # Layer 4: Model Predicted Reconstructed Route (Purple dashed overlay)
+    # Layer 4: Model Predicted Reconstructed Route (Purple dashed merged polylines)
     pred_layer = folium.FeatureGroup(
         name="Layer 4: Predicted HMM Route (Purple)",
         show=visibility["predicted"],
     )
-    for idx, arc in enumerate(pred_arcs):
-        coords = arc.get("coords", [])
-        if len(coords) < 2:
-            continue
-        arc_id = arc.get("arc_id", "?")
-        length_m = arc.get("length", 0.0)
+    for chain_idx, chain in enumerate(_merge_contiguous_polylines(pred_arcs), start=1):
         folium.PolyLine(
-            locations=coords,
+            locations=chain,
             color=LAYER_COLORS["predicted"],
-            weight=4.0,
+            weight=3.8,
             opacity=0.95,
             dash_array="8, 6",
-            tooltip=f"Predicted HMM [{idx + 1}] | Arc #{arc_id} ({float(length_m):.1f}m)",
+            tooltip=f"Predicted HMM Route Segment #{chain_idx} ({len(pred_arcs)} total arcs)",
         ).add_to(pred_layer)
     pred_layer.add_to(fmap)
 
-    # Index per-step details by step_idx for rich GPS popups
+    # Index per-step details by step_idx
     detail_by_step: dict[int, Mapping[str, Any]] = {
         int(item["step_idx"]): item for item in step_details if "step_idx" in item
     }
 
-    # Layer 1: Raw GPS Observations (Blue circle markers)
+    # Layer 1: Raw GPS Observations (Blue circle markers; evenly strided for multi-thousand tracks)
     gps_layer = folium.FeatureGroup(
         name="Layer 1: Raw GPS Observations (Blue)",
         show=visibility["gps"],
@@ -267,17 +299,31 @@ def create_trip_map_from_payload(
         show=visibility["mismatches"],
     )
 
+    n_gps = len(gps_points)
+    stride = max(1, n_gps // max_gps_markers) if n_gps > max_gps_markers else 1
+    sampled_indices = set(range(0, n_gps, stride))
+    if n_gps > 0:
+        sampled_indices.add(0)
+        sampled_indices.add(n_gps - 1)
+
+    mismatch_count = 0
     for idx, pt in enumerate(gps_points):
         step_idx = int(pt.get("step_idx", idx))
+        detail = detail_by_step.get(step_idx, {})
+        is_match = detail.get("is_match")
+
+        show_blue = idx in sampled_indices
+        show_red = is_match is False and mismatch_count < 160
+        if not show_blue and not show_red:
+            continue
+
         lat = float(pt.get("lat", pt.get("gps_lat")))
         lon = float(pt.get("lon", pt.get("gps_lon")))
         ts = pt.get("timestamp", idx)
-        detail = detail_by_step.get(step_idx, {})
         gt_arc = detail.get("ground_truth_arc_id", "N/A")
         pred_arc = detail.get("predicted_arc_id", "N/A")
-        is_match = detail.get("is_match")
-
         status_label = "MATCH" if is_match is True else ("MISMATCH" if is_match is False else "N/A")
+
         popup_html = (
             f"<div style='font-family:sans-serif;font-size:12px;min-width:170px;'>"
             f"<b>GPS Observation #{step_idx}</b><br>"
@@ -289,24 +335,26 @@ def create_trip_map_from_payload(
             f"</div>"
         )
 
-        folium.CircleMarker(
-            location=[lat, lon],
-            radius=4.5,
-            color="#1E3A8A",
-            weight=1.2,
-            fill=True,
-            fill_color=LAYER_COLORS["gps"],
-            fill_opacity=0.88,
-            tooltip=f"GPS #{step_idx} | GT={gt_arc} | Pred={pred_arc}",
-            popup=folium.Popup(popup_html, max_width=240),
-        ).add_to(gps_layer)
-
-        if is_match is False:
+        if show_blue:
             folium.CircleMarker(
                 location=[lat, lon],
-                radius=8.0,
+                radius=4.0,
+                color="#1E3A8A",
+                weight=1.0,
+                fill=True,
+                fill_color=LAYER_COLORS["gps"],
+                fill_opacity=0.85,
+                tooltip=f"GPS #{step_idx} | GT={gt_arc} | Pred={pred_arc}",
+                popup=folium.Popup(popup_html, max_width=240),
+            ).add_to(gps_layer)
+
+        if show_red:
+            mismatch_count += 1
+            folium.CircleMarker(
+                location=[lat, lon],
+                radius=7.0,
                 color=LAYER_COLORS["mismatch"],
-                weight=2.2,
+                weight=2.0,
                 fill=True,
                 fill_color=LAYER_COLORS["mismatch"],
                 fill_opacity=0.35,
@@ -316,10 +364,8 @@ def create_trip_map_from_payload(
 
     gps_layer.add_to(fmap)
 
-    # Start & End trip markers
     if gps_points:
-        first_pt = gps_points[0]
-        last_pt = gps_points[-1]
+        first_pt, last_pt = gps_points[0], gps_points[-1]
         folium.Marker(
             location=[
                 float(first_pt.get("lat", first_pt.get("gps_lat"))),
@@ -342,8 +388,13 @@ def create_trip_map_from_payload(
     if bounds is not None:
         fmap.fit_bounds(bounds, padding=(28, 28))
 
+    gps_note = (
+        f"Displaying {len(sampled_indices)} / {n_gps:,} GPS markers (1-in-{stride} stride)"
+        if stride > 1
+        else f"Displaying all {n_gps:,} GPS observations"
+    )
     folium.LayerControl(collapsed=False).add_to(fmap)
-    fmap.get_root().html.add_child(folium.Element(_build_legend_html(trip_id, metrics)))
+    fmap.get_root().html.add_child(folium.Element(_build_legend_html(trip_id, metrics, gps_note)))
     return fmap
 
 
@@ -353,7 +404,6 @@ def _extract_arc_record_from_graph(
     v: Any,
     edge_data: Mapping[str, Any],
 ) -> dict[str, Any] | None:
-    """Extract a standardized arc geometry dictionary from a NetworkX DiGraph edge."""
     coords = edge_data.get("coords")
     if not coords:
         u_data = graph.nodes[u]
@@ -406,25 +456,12 @@ def create_trip_map_from_graph(
             arc
             for arc in all_arcs
             if any(min_lat <= c[0] <= max_lat and min_lon <= c[1] <= max_lon for c in arc["coords"])
-        ]
+        ][:1100]
     else:
-        local_road_arcs = all_arcs[:600]
+        local_road_arcs = all_arcs[:1100]
 
     gt_arcs = [arc_lookup[aid] for aid in ground_truth_arc_ids if aid in arc_lookup]
     pred_arcs = [arc_lookup[aid] for aid in predicted_arc_ids if aid in arc_lookup]
-
-    step_details = []
-    for idx, pt in enumerate(gps_points):
-        gt_id = ground_truth_arc_ids[idx] if idx < len(ground_truth_arc_ids) else None
-        pred_id = predicted_arc_ids[idx] if idx < len(predicted_arc_ids) else None
-        step_details.append(
-            {
-                "step_idx": int(pt.get("step_idx", idx)),
-                "ground_truth_arc_id": gt_id,
-                "predicted_arc_id": pred_id,
-                "is_match": (gt_id == pred_id) if (gt_id is not None and pred_id is not None) else None,
-            }
-        )
 
     payload = {
         "trip_id": trip_id,
@@ -432,7 +469,7 @@ def create_trip_map_from_graph(
         "road_network_arcs": local_road_arcs,
         "ground_truth_arcs": gt_arcs,
         "predicted_arcs": pred_arcs,
-        "step_details": step_details,
+        "step_details": [],
         "metrics": dict(metrics) if metrics else None,
     }
     return create_trip_map_from_payload(payload=payload, tiles=tiles)

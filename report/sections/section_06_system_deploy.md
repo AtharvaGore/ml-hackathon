@@ -15,7 +15,7 @@ The FastAPI server exposes four structured endpoints with Cross-Origin Resource 
 
 | Endpoint | Method | Request Schema | Purpose |
 | :--- | :--- | :--- | :--- |
-| `/health` | `GET` | — | Reports readiness, active mode (`full_real`, `partial_real`, or `mock_demo`), detected LAN IP, graph statistics, and loaded teammate modules. |
+| `/health` | `GET` | — | Reports readiness, active mode (`full_real`, `real_data_pipeline`, or `mock_demo`), detected LAN IP, graph statistics, and loaded teammate modules. |
 | `/trips` | `GET` | — | Lists metadata (trip ID, GPS observation count, duration) for the 10 evaluation trips without exposing ground truth. |
 | `/predict_trip` | `POST` | `{"trip_id": str}` | Executes the full inference pipeline (Raw Track -> Candidate Generation -> Classifier Emissions -> HMM Viterbi -> Metrics & Geometry Packing). |
 | `/predict_batch` | `POST` | `{"trip_ids": list or null}` | Evaluates all 10 trips sequentially and aggregates mean Top-1 Accuracy, Route Continuity, Route F1, and server latency. |

@@ -49,9 +49,7 @@ Thumbs.db
 .env
 .env.local
 
-# Large raw datasets & generated map exports (keep .gitkeep)
-data/*
-!data/.gitkeep
+# Generated exports, parquet caches & logs
 artifacts/*.parquet
 exports/
 *.log

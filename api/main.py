@@ -112,7 +112,7 @@ def _get_pipeline() -> MapMatchingPipeline:
 def _log_startup_banner(pipeline: MapMatchingPipeline, lan_ip: str) -> None:
     health = pipeline.health_summary()
     mode = health["pipeline_mode"]
-    mode_color = _Ansi.GREEN if mode == "full_real" else _Ansi.YELLOW
+    mode_color = _Ansi.GREEN if mode in ("full_real", "real_data_pipeline") else _Ansi.YELLOW
     port = os.getenv("API_PORT", "8000")
 
     lines = [
@@ -285,11 +285,11 @@ def predict_batch(payload: PredictBatchRequest, request: Request) -> dict[str, A
     """Run inference across all (or selected) evaluation trips and aggregate metrics."""
     pipeline = _get_pipeline()
     client_ip = request.client.host if request.client else "unknown"
-    target_ids = payload.trip_ids or sorted(pipeline.eval_trips.keys())
+    target_ids = payload.trip_ids or sorted(pipeline.eval_trip_meta.keys())
 
     rows: list[dict[str, Any]] = []
     for tid in target_ids:
-        if tid not in pipeline.eval_trips:
+        if tid not in pipeline.eval_trip_meta:
             raise HTTPException(status_code=404, detail=f"Unknown trip_id '{tid}'.")
         res = pipeline.predict_trip(tid)
         m = res["metrics"]
@@ -301,6 +301,7 @@ def predict_batch(payload: PredictBatchRequest, request: Request) -> dict[str, A
                 "top1_accuracy": m["top1_accuracy"],
                 "route_continuity": m["route_continuity"],
                 "route_f1": m["route_f1"],
+                "length_weighted_f1": m.get("length_weighted_f1", m["route_f1"]),
                 "sequence_jaccard": m["sequence_jaccard"],
                 "discontinuities": m["discontinuities"],
                 "classifier_only_top1_accuracy": m["classifier_only_top1_accuracy"],

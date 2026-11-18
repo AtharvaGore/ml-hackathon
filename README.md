@@ -96,16 +96,16 @@ Ensure **Laptop 1** and **Laptop 2** are connected to the same Wi-Fi network or 
 
 | Method | Endpoint | Payload | Description |
 | :--- | :--- | :--- | :--- |
-| `GET` | `/health` | — | Server status, pipeline mode (`full_real` / `partial_real` / `mock_demo`), graph stats, loaded modules |
-| `GET` | `/trips` | — | Metadata for the 10 held-out evaluation trips (no ground-truth leakage) |
-| `POST` | `/predict_trip` | `{"trip_id": "eval_trip_01"}` | Runs full pipeline (`Track -> Candidates -> Classifier -> HMM Viterbi -> Metrics`) |
+| `GET` | `/health` | — | Server status, pipeline mode (`full_real` / `real_data_pipeline` / `mock_demo`), graph stats, loaded modules |
+| `GET` | `/trips` | — | Metadata for the 10 held-out evaluation trips in `data/Student folder/student_test/` (no ground-truth leakage) |
+| `POST` | `/predict_trip` | `{"trip_id": "00000052"}` | Runs full pipeline (`Track -> Candidates -> Classifier -> HMM Viterbi -> Metrics`) |
 | `POST` | `/predict_batch` | `{"trip_ids": null}` | Evaluates all 10 trips and returns per-trip + macro summary metrics |
 
 Quick CLI verification from Laptop 2:
 ```bash
 curl -X POST http://<LAPTOP_1_IP>:8000/predict_trip \
   -H "Content-Type: application/json" \
-  -d '{"trip_id": "eval_trip_01"}'
+  -d '{"trip_id": "00000052"}'
 ```
 
 ---

@@ -31,7 +31,18 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.visualizer import SUPPORTED_TILES, create_trip_map_from_payload, map_to_html_str
 
 
-DEFAULT_EVAL_TRIPS = [f"eval_trip_{i:02d}" for i in range(1, 11)]
+DEFAULT_EVAL_TRIPS = [
+    "00000000",
+    "00000007",
+    "00000009",
+    "00000040",
+    "00000052",
+    "00000056",
+    "00000065",
+    "00000076",
+    "00000077",
+    "00000091",
+]
 
 
 def _normalize_base_url(host_input: str, port: int) -> str:
