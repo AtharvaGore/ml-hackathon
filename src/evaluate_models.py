@@ -18,12 +18,20 @@ from sklearn.metrics import (
     confusion_matrix,
 )
 
-from train_models import (
-    DATASET,
-    OUTPUT_DIR,
-    FEATURE_COLUMNS,
-    build_models,
-)
+try:
+    from train_models import (
+        DATASET,
+        OUTPUT_DIR,
+        FEATURE_COLUMNS,
+        build_models,
+    )
+except ImportError:
+    from src.train_models import (
+        DATASET,
+        OUTPUT_DIR,
+        FEATURE_COLUMNS,
+        build_models,
+    )
 
 ALIGNMENT_FILE = OUTPUT_DIR / "trip_alignment_report.csv"
 SUMMARY_FILE = OUTPUT_DIR / "evaluation_summary.csv"
