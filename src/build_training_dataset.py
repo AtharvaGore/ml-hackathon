@@ -187,22 +187,23 @@ def align_route_labels(features, track, route):
             run_states.append(states_by_observation[i])
             i += 1
 
-        # Divide a run whenever no monotonic transition is possible.
+        # Split whenever globally reachable route positions
+        # cannot continue into the next observation.
         chunk_start = 0
+        reachable = {position for position, _ in run_states[0]}
 
         for j in range(1, len(run_states)):
-            previous_positions = {
-                position for position, _ in run_states[j - 1]
-            }
             current_positions = {
                 position for position, _ in run_states[j]
             }
 
-            if not any(
-                previous <= current
-                for previous in previous_positions
+            next_reachable = {
+                current
                 for current in current_positions
-            ):
+                if any(previous <= current for previous in reachable)
+            }
+
+            if not next_reachable:
                 chunk = run_states[chunk_start:j]
                 result = solve_alignment_chunk(chunk)
 
@@ -213,6 +214,9 @@ def align_route_labels(features, track, route):
                     ] = result
 
                 chunk_start = j
+                reachable = current_positions
+            else:
+                reachable = next_reachable
 
         chunk = run_states[chunk_start:]
         result = solve_alignment_chunk(chunk)
