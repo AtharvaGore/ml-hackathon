@@ -88,6 +88,10 @@ class PredictBatchRequest(BaseModel):
         default=None,
         description="Optional subset of trip IDs. Omit to evaluate all server-side trips.",
     )
+    partition: Optional[str] = Field(
+        default=None,
+        description="Optional partition filter: 'student_test' or 'evaluator_test'.",
+    )
 
 
 # ----------------------------------------------------------------------
@@ -243,10 +247,10 @@ def health() -> dict[str, Any]:
 
 
 @app.get("/trips", tags=["Evaluation"])
-def list_trips() -> dict[str, Any]:
+def list_trips(partition: Optional[str] = None) -> dict[str, Any]:
     """Return metadata for the evaluation trips available on Laptop 1."""
     pipeline = _get_pipeline()
-    trips = pipeline.list_eval_trips()
+    trips = pipeline.list_eval_trips(partition=partition)
     return {
         "count": len(trips),
         "pipeline_mode": pipeline.status.mode,
@@ -285,7 +289,14 @@ def predict_batch(payload: PredictBatchRequest, request: Request) -> dict[str, A
     """Run inference across all (or selected) evaluation trips and aggregate metrics."""
     pipeline = _get_pipeline()
     client_ip = request.client.host if request.client else "unknown"
-    target_ids = payload.trip_ids or sorted(pipeline.eval_trip_meta.keys())
+    if payload.trip_ids:
+        target_ids = payload.trip_ids
+    elif payload.partition in ("student_test", "student"):
+        target_ids = [t for t in sorted(pipeline.eval_trip_meta.keys()) if pipeline.eval_trip_meta[t].get("partition") == "student_test"]
+    elif payload.partition in ("evaluator_test", "evaluator"):
+        target_ids = [t for t in sorted(pipeline.eval_trip_meta.keys()) if pipeline.eval_trip_meta[t].get("partition") == "evaluator_test"]
+    else:
+        target_ids = sorted(pipeline.eval_trip_meta.keys())
 
     rows: list[dict[str, Any]] = []
     for tid in target_ids:

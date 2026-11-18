@@ -299,6 +299,33 @@ class TripBundle:
     p1_candidate_gen: Any | None = None
 
 
+STUDENT_TEST_TRIP_IDS = [
+    "00000000",
+    "00000007",
+    "00000009",
+    "00000040",
+    "00000052",
+    "00000056",
+    "00000065",
+    "00000076",
+    "00000077",
+    "00000091",
+]
+
+EVALUATOR_TEST_TRIP_IDS = [
+    "00000015",
+    "00000017",
+    "00000023",
+    "00000030",
+    "00000049",
+    "00000059",
+    "00000067",
+    "00000073",
+    "00000087",
+    "00000094",
+]
+
+
 class MapMatchingPipeline:
     """Server-side orchestrator for GPS trajectory map-matching and evaluation."""
 
@@ -366,74 +393,87 @@ class MapMatchingPipeline:
             except Exception:
                 return None
 
-    def _find_student_test_dir(self) -> Path | None:
+    def _find_test_dirs(self) -> list[Path]:
+        dirs: list[Path] = []
         candidates = [
             self.data_dir / "Student folder" / "student_test",
+            self.data_dir / "Student folder" / "evaluator_test",
             self.data_dir / "student_test",
-            self.data_dir / "test",
+            self.data_dir / "evaluator_test",
+            PROJECT_ROOT / "evaluator_test",
         ]
         for cand in candidates:
-            if cand.exists() and cand.is_dir():
-                return cand
+            if cand.exists() and cand.is_dir() and cand not in dirs:
+                dirs.append(cand)
         if self.data_dir.exists():
-            for match in self.data_dir.rglob("student_test"):
-                if match.is_dir():
-                    return match
-        return None
+            for match in self.data_dir.rglob("*test"):
+                if match.is_dir() and match not in dirs:
+                    dirs.append(match)
+        return dirs
 
     def _discover_real_eval_trips(self) -> bool:
-        """Discover the 10 real evaluation trips in `data/Student folder/student_test/`."""
-        test_dir = self._find_student_test_dir()
-        if test_dir is None:
+        """Discover evaluation trips across student_test and evaluator_test partitions."""
+        test_dirs = self._find_test_dirs()
+        if not test_dirs:
             return False
 
         trip_dirs: dict[str, Path] = {}
         trip_meta: dict[str, dict[str, Any]] = {}
 
-        for sub in sorted(test_dir.iterdir()):
-            if not sub.is_dir():
-                continue
-            tid = sub.name
-            nodes_f = sub / f"{tid}.nodes"
-            arcs_f = sub / f"{tid}.arcs"
-            track_f = sub / f"{tid}.track"
-            route_f = sub / f"{tid}.route"
-            if not (nodes_f.exists() and arcs_f.exists() and track_f.exists()):
-                continue
+        for t_dir in test_dirs:
+            for sub in sorted(t_dir.iterdir()):
+                if not sub.is_dir() or sub.name.startswith("."):
+                    continue
+                tid = sub.name
+                if tid in trip_dirs:
+                    continue
+                nodes_f = sub / f"{tid}.nodes"
+                arcs_f = sub / f"{tid}.arcs"
+                track_f = sub / f"{tid}.track"
+                route_f = sub / f"{tid}.route"
+                if not (nodes_f.exists() and arcs_f.exists() and track_f.exists()):
+                    continue
 
-            track_lines = [
-                l for l in track_f.read_text(encoding="utf-8", errors="ignore").splitlines() if l.strip()
-            ]
-            num_nodes = sum(1 for l in nodes_f.open("r", encoding="utf-8", errors="ignore") if l.strip())
-            num_arcs = sum(1 for l in arcs_f.open("r", encoding="utf-8", errors="ignore") if l.strip())
+                track_lines = [
+                    l for l in track_f.read_text(encoding="utf-8", errors="ignore").splitlines() if l.strip()
+                ]
+                num_nodes = sum(1 for l in nodes_f.open("r", encoding="utf-8", errors="ignore") if l.strip())
+                num_arcs = sum(1 for l in arcs_f.open("r", encoding="utf-8", errors="ignore") if l.strip())
 
-            duration_s = 0.0
-            start_coord = ""
-            if track_lines:
-                first_parts = track_lines[0].split()
-                last_parts = track_lines[-1].split()
-                if len(first_parts) >= 3 and len(last_parts) >= 3:
-                    try:
-                        duration_s = round(float(last_parts[2]) - float(first_parts[2]), 1)
-                    except ValueError:
-                        duration_s = float(len(track_lines))
-                if len(first_parts) >= 2:
-                    try:
-                        lon0, lat0 = float(first_parts[0]), float(first_parts[1])
-                        start_coord = f"({lat0:.3f}, {lon0:.3f})"
-                    except ValueError:
-                        pass
+                duration_s = 0.0
+                start_coord = ""
+                if track_lines:
+                    first_parts = track_lines[0].split()
+                    last_parts = track_lines[-1].split()
+                    if len(first_parts) >= 3 and len(last_parts) >= 3:
+                        try:
+                            duration_s = round(float(last_parts[2]) - float(first_parts[2]), 1)
+                        except ValueError:
+                            duration_s = float(len(track_lines))
+                    if len(first_parts) >= 2:
+                        try:
+                            lon0, lat0 = float(first_parts[0]), float(first_parts[1])
+                            start_coord = f"({lat0:.3f}, {lon0:.3f})"
+                        except ValueError:
+                            pass
 
-            trip_dirs[tid] = sub
-            trip_meta[tid] = {
-                "trip_id": tid,
-                "num_points": len(track_lines),
-                "duration_s": duration_s,
-                "num_nodes": num_nodes,
-                "num_arcs": num_arcs,
-                "has_ground_truth": route_f.exists(),
-                "description": f"Real trip {tid} @ {start_coord} · {num_arcs:,} road arcs",
-            }
+                partition = (
+                    "evaluator_test"
+                    if tid in EVALUATOR_TEST_TRIP_IDS or "evaluator" in str(sub).lower()
+                    else "student_test"
+                )
+                partition_label = "Evaluator Test" if partition == "evaluator_test" else "Student Test"
+                trip_dirs[tid] = sub
+                trip_meta[tid] = {
+                    "trip_id": tid,
+                    "partition": partition,
+                    "num_points": len(track_lines),
+                    "duration_s": duration_s,
+                    "num_nodes": num_nodes,
+                    "num_arcs": num_arcs,
+                    "has_ground_truth": route_f.exists(),
+                    "description": f"[{partition_label}] {tid} @ {start_coord} · {num_arcs:,} road arcs",
+                }
 
         if not trip_dirs:
             return False
@@ -722,10 +762,11 @@ class MapMatchingPipeline:
     # ------------------------------------------------------------------
     # Public inspection helpers
     # ------------------------------------------------------------------
-    def list_eval_trips(self) -> list[dict[str, Any]]:
-        return [
+    def list_eval_trips(self, partition: str | None = None) -> list[dict[str, Any]]:
+        trips = [
             {
                 "trip_id": tid,
+                "partition": meta.get("partition", "student_test"),
                 "num_points": meta["num_points"],
                 "duration_s": meta["duration_s"],
                 "num_nodes": meta["num_nodes"],
@@ -734,6 +775,11 @@ class MapMatchingPipeline:
             }
             for tid, meta in sorted(self.eval_trip_meta.items())
         ]
+        if partition in ("student_test", "student"):
+            trips = [t for t in trips if t["partition"] == "student_test"]
+        elif partition in ("evaluator_test", "evaluator"):
+            trips = [t for t in trips if t["partition"] == "evaluator_test"]
+        return trips
 
     def health_summary(self) -> dict[str, Any]:
         total_nodes = sum(m["num_nodes"] for m in self.eval_trip_meta.values())
@@ -749,6 +795,14 @@ class MapMatchingPipeline:
             },
             "num_eval_trips": len(self.eval_trip_meta),
             "eval_trip_ids": sorted(self.eval_trip_meta.keys()),
+            "student_test_trip_ids": [
+                t for t in sorted(self.eval_trip_meta.keys())
+                if self.eval_trip_meta[t].get("partition") == "student_test"
+            ],
+            "evaluator_test_trip_ids": [
+                t for t in sorted(self.eval_trip_meta.keys())
+                if self.eval_trip_meta[t].get("partition") == "evaluator_test"
+            ],
             "model_path": str(self.model_path),
             "model_loaded": self.model is not None,
         }

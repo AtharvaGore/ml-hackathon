@@ -31,7 +31,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.visualizer import SUPPORTED_TILES, create_trip_map_from_payload, map_to_html_str
 
 
-DEFAULT_EVAL_TRIPS = [
+STUDENT_TEST_TRIPS = [
     "00000000",
     "00000007",
     "00000009",
@@ -43,6 +43,21 @@ DEFAULT_EVAL_TRIPS = [
     "00000077",
     "00000091",
 ]
+
+EVALUATOR_TEST_TRIPS = [
+    "00000015",
+    "00000017",
+    "00000023",
+    "00000030",
+    "00000049",
+    "00000059",
+    "00000067",
+    "00000073",
+    "00000087",
+    "00000094",
+]
+
+DEFAULT_EVAL_TRIPS = STUDENT_TEST_TRIPS
 
 
 def _normalize_base_url(host_input: str, port: int) -> str:
@@ -100,13 +115,21 @@ def _predict_single_trip(
 
 
 def _predict_batch(
-    base_url: str, trip_ids: list[str] | None = None, timeout: float = 60.0
+    base_url: str,
+    trip_ids: list[str] | None = None,
+    partition: str | None = None,
+    timeout: float = 60.0,
 ) -> tuple[dict[str, Any] | None, float, str | None]:
     t0 = time.perf_counter()
     try:
+        payload: dict[str, Any] = {}
+        if trip_ids:
+            payload["trip_ids"] = trip_ids
+        if partition:
+            payload["partition"] = partition
         resp = requests.post(
             f"{base_url}/predict_batch",
-            json={"trip_ids": trip_ids},
+            json=payload,
             timeout=timeout,
         )
         rtt_ms = (time.perf_counter() - t0) * 1000.0
@@ -188,10 +211,34 @@ def main() -> None:
         <style>
         .block-container { padding-top: 1.4rem; padding-bottom: 2rem; }
         div[data-testid="stMetric"] {
-            background: #F8FAFC;
-            border: 1px solid #E2E8F0;
-            border-radius: 10px;
-            padding: 12px 16px;
+            background-color: #0F172A !important;
+            border: 1px solid #334155 !important;
+            border-radius: 12px !important;
+            padding: 14px 18px !important;
+            box-shadow: 0 4px 12px rgba(15, 23, 42, 0.25) !important;
+        }
+        div[data-testid="stMetric"] label,
+        div[data-testid="stMetric"] [data-testid="stMetricLabel"] p,
+        div[data-testid="stMetric"] [data-testid="stMetricLabel"] {
+            color: #94A3B8 !important;
+            font-size: 0.82rem !important;
+            font-weight: 600 !important;
+            text-transform: uppercase !important;
+            letter-spacing: 0.05em !important;
+        }
+        div[data-testid="stMetric"] [data-testid="stMetricValue"] div,
+        div[data-testid="stMetric"] [data-testid="stMetricValue"],
+        div[data-testid="stMetric"] [data-testid="stMetricValue"] * {
+            color: #38BDF8 !important;
+            font-size: 1.9rem !important;
+            font-weight: 800 !important;
+            line-height: 1.2 !important;
+        }
+        div[data-testid="stMetric"] [data-testid="stMetricDelta"] div,
+        div[data-testid="stMetric"] [data-testid="stMetricDelta"],
+        div[data-testid="stMetric"] [data-testid="stMetricDelta"] * {
+            font-weight: 600 !important;
+            font-size: 0.85rem !important;
         }
         .status-pill-ok {
             display:inline-block; padding:4px 10px; border-radius:999px;
@@ -250,21 +297,50 @@ def main() -> None:
                 st.error(f"Cannot reach Laptop 1: {health_err}")
 
         st.divider()
-        st.header("Evaluation Trip")
+        st.header("Evaluation Partition")
+
+        selected_partition = st.radio(
+            "Select Test Suite",
+            options=["Student Test (10 trips)", "Evaluator Test (10 trips)", "All Combined (20 trips)"],
+            index=0,
+            help="Switch between Student Test (development benchmark) and Evaluator Test (official live viva).",
+        )
 
         trips_meta, _ = _fetch_trips(base_url) if health_data else ([], None)
         if trips_meta:
-            trip_options = [t["trip_id"] for t in trips_meta]
+            student_meta = [
+                t for t in trips_meta
+                if t.get("partition") == "student_test" or t["trip_id"] in STUDENT_TEST_TRIPS
+            ]
+            evaluator_meta = [
+                t for t in trips_meta
+                if t.get("partition") == "evaluator_test" or t["trip_id"] in EVALUATOR_TEST_TRIPS
+            ]
+
+            if "Student Test" in selected_partition:
+                active_meta = student_meta or [t for t in trips_meta if t["trip_id"] in STUDENT_TEST_TRIPS]
+            elif "Evaluator Test" in selected_partition:
+                active_meta = evaluator_meta or [t for t in trips_meta if t["trip_id"] in EVALUATOR_TEST_TRIPS]
+            else:
+                active_meta = trips_meta
+
+            trip_options = [t["trip_id"] for t in active_meta]
             trip_desc_map = {
                 t["trip_id"]: f"{t['trip_id']} ({t['num_points']} pts, {t['duration_s']}s)"
-                for t in trips_meta
+                for t in active_meta
             }
         else:
-            trip_options = DEFAULT_EVAL_TRIPS
-            trip_desc_map = {t: t for t in DEFAULT_EVAL_TRIPS}
+            if "Student Test" in selected_partition:
+                trip_options = STUDENT_TEST_TRIPS
+            elif "Evaluator Test" in selected_partition:
+                trip_options = EVALUATOR_TEST_TRIPS
+            else:
+                trip_options = STUDENT_TEST_TRIPS + EVALUATOR_TEST_TRIPS
+            trip_desc_map = {t: t for t in trip_options}
 
+        partition_name = "Student-Test" if "Student" in selected_partition else ("Evaluator-Test" if "Evaluator" in selected_partition else "All")
         selected_trip = st.selectbox(
-            "Select Evaluation Trip (10 Trips)",
+            f"Select Trip ({len(trip_options)} in {partition_name})",
             options=trip_options,
             format_func=lambda tid: trip_desc_map.get(tid, tid),
         )
@@ -436,26 +512,61 @@ def main() -> None:
     # Tab 2: 10-Trip Batch Evaluator
     # ------------------------------------------------------------------
     with tab_batch:
-        st.subheader("Full 10-Trip Evaluation Suite")
+        st.subheader("Batch Evaluation Suite")
         st.write(
-            "Evaluate all 10 held-out trips stored on Laptop 1 in a single batch call "
-            "to inspect aggregate accuracy, continuity, and latency."
+            "Evaluate held-out evaluation trips stored on Laptop 1 in a single batch call "
+            "to inspect aggregate accuracy, continuity, and latency across either partition."
         )
-        if st.button(
-            "Evaluate All 10 Trips",
+
+        col_b1, col_b2, col_b3 = st.columns(3)
+        run_student = col_b1.button(
+            "Run Student-Test (10 Trips)",
             type="primary",
+            use_container_width=True,
             disabled=(health_data is None),
-        ):
-            with st.spinner(f"Running POST {base_url}/predict_batch across all evaluation trips..."):
-                batch_data, batch_rtt, batch_err = _predict_batch(base_url)
+        )
+        run_evaluator = col_b2.button(
+            "Run Evaluator-Test (10 Trips)",
+            type="primary",
+            use_container_width=True,
+            disabled=(health_data is None),
+        )
+        run_all = col_b3.button(
+            "Run All Combined (20 Trips)",
+            type="secondary",
+            use_container_width=True,
+            disabled=(health_data is None),
+        )
+
+        batch_target_ids = None
+        suite_label = None
+        if run_student:
+            batch_target_ids = STUDENT_TEST_TRIPS
+            suite_label = "Student-Test Suite (10 Trips)"
+        elif run_evaluator:
+            batch_target_ids = EVALUATOR_TEST_TRIPS
+            suite_label = "Evaluator-Test Suite (10 Trips)"
+        elif run_all:
+            batch_target_ids = None
+            suite_label = "All Combined (20 Trips)"
+
+        if suite_label is not None:
+            with st.spinner(f"Running POST {base_url}/predict_batch for {suite_label}..."):
+                batch_data, batch_rtt, batch_err = _predict_batch(
+                    base_url,
+                    trip_ids=batch_target_ids,
+                )
             if batch_err:
                 st.error(f"Batch evaluation failed: {batch_err}")
             else:
                 st.session_state["last_batch"] = batch_data
                 st.session_state["last_batch_rtt_ms"] = batch_rtt
+                st.session_state["last_batch_label"] = suite_label
 
         batch = st.session_state.get("last_batch")
         if batch:
+            last_label = st.session_state.get("last_batch_label", "Batch Results")
+            st.markdown(f"#### Summary for **{last_label}**")
             s = batch["summary"]
             b1, b2, b3, b4 = st.columns(4)
             b1.metric(
