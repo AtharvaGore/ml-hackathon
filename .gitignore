@@ -1,9 +1,21 @@
-# Python
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Jupyter & Notebooks
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Distribution / packaging
 build/
 develop-eggs/
 dist/
@@ -19,16 +31,6 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-
-# Virtual environments
-.venv/
-venv/
-ENV/
-env/
-
-# Jupyter & Notebooks
-.ipynb_checkpoints/
-*.ipynb_checkpoints
 
 # Testing & caches
 .pytest_cache/
@@ -49,7 +51,7 @@ Thumbs.db
 .env
 .env.local
 
-# Generated exports, parquet caches & logs
+# Generated temporary exports, parquet caches & logs
 artifacts/*.parquet
 exports/
 *.log

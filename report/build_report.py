@@ -208,24 +208,46 @@ def generate_architecture_diagram(output_path: Path) -> Path:
 
 
 def _clean_md(text: str) -> str:
-    """Strip basic inline markdown markers cleanly for vector PDF rendering."""
+    """Strip inline markdown & LaTeX formatting cleanly for crisp vector PDF rendering."""
     cleaned = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
     cleaned = re.sub(r"\*(.*?)\*", r"\1", cleaned)
     cleaned = re.sub(r"`([^`]+)`", r"\1", cleaned)
-    cleaned = cleaned.replace("$G = (V, E)$", "G = (V, E)")
+    # Clean common LaTeX tokens from teammate sections
+    cleaned = cleaned.replace("$$", "")
+    cleaned = re.sub(r"\\text\{([^}]*)\}", r"\1", cleaned)
+    cleaned = cleaned.replace(r"\rightarrow", "->").replace(r"\approx", "~").replace(r"\times", "x")
+    cleaned = cleaned.replace(r"\ge", ">=").replace(r"\le", "<=").replace(r"\in", "in")
+    cleaned = cleaned.replace(r"\Delta", "d").replace(r"\phi", "phi").replace(r"\lambda", "lon")
+    cleaned = cleaned.replace(r"\theta", "theta").replace(r"\sigma", "sigma").replace(r"\perp", "_perp")
+    cleaned = cleaned.replace(r"\quad", "  ").replace(r"\cdot", "*").replace(r"\%", "%")
+    cleaned = cleaned.replace(r"^\circ", " deg").replace("$", "")
+    cleaned = re.sub(r"\\([a-zA-Z]+)", r"\1", cleaned)
     return cleaned
 
 
 def _parse_markdown_blocks(md_text: str, base_dir: Path) -> list[dict[str, Any]]:
-    """Parse markdown text into structured layout blocks."""
+    """Parse markdown text into structured layout blocks (handles fenced code & HR too)."""
     blocks: list[dict[str, Any]] = []
     lines = md_text.splitlines()
     idx = 0
 
     while idx < len(lines):
         stripped = lines[idx].strip()
-        if not stripped:
+        if not stripped or stripped in ("---", "***"):
             idx += 1
+            continue
+
+        # Fenced code block
+        if stripped.startswith("```"):
+            idx += 1
+            code_lines: list[str] = []
+            while idx < len(lines) and not lines[idx].strip().startswith("```"):
+                code_lines.append(lines[idx].rstrip())
+                idx += 1
+            if idx < len(lines):
+                idx += 1
+            if code_lines:
+                blocks.append({"type": "code", "text": "\n".join(code_lines)})
             continue
 
         img_match = re.match(r"^!\[(.*?)\]\((.*?)\)$", stripped)
@@ -256,8 +278,8 @@ def _parse_markdown_blocks(md_text: str, base_dir: Path) -> list[dict[str, Any]]
             blocks.append({"type": "h2", "text": _clean_md(stripped[3:])})
             idx += 1
             continue
-        if stripped.startswith("### "):
-            blocks.append({"type": "h3", "text": _clean_md(stripped[4:])})
+        if stripped.startswith("### ") or stripped.startswith("#### "):
+            blocks.append({"type": "h3", "text": _clean_md(stripped.lstrip("# "))})
             idx += 1
             continue
 
@@ -275,9 +297,11 @@ def _parse_markdown_blocks(md_text: str, base_dir: Path) -> list[dict[str, Any]]
             nxt = lines[idx].strip()
             if (
                 not nxt
+                or nxt in ("---", "***")
                 or nxt.startswith("#")
                 or nxt.startswith("|")
                 or nxt.startswith("![")
+                or nxt.startswith("```")
                 or re.match(r"^([-*]|\d+\.)\s+", nxt)
             ):
                 break
@@ -576,6 +600,35 @@ class _A4PdfWriter:
             )
             self.cursor_y -= 0.024
 
+    def draw_code(self, text: str) -> None:
+        lines = text.splitlines()
+        line_h = 0.0145
+        box_h = len(lines) * line_h + 0.016
+        self.ensure_space(box_h + 0.012)
+        self.ax.add_patch(
+            mpatches.Rectangle(
+                (self.left_x, self.cursor_y - box_h),
+                self.right_x - self.left_x,
+                box_h,
+                facecolor="#F1F5F9",
+                edgecolor="#CBD5E1",
+                linewidth=0.6,
+            )
+        )
+        y = self.cursor_y - 0.008
+        for line in lines:
+            self.ax.text(
+                self.left_x + 0.010,
+                y,
+                line[:96],
+                fontsize=7.4,
+                family="monospace",
+                color="#0F172A",
+                va="top",
+            )
+            y -= line_h
+        self.cursor_y -= box_h + 0.014
+
     def close(self) -> None:
         self._finish_page()
 
@@ -587,11 +640,20 @@ def build_technical_report(output_pdf: Path = OUTPUT_PDF) -> Path:
     output_pdf.parent.mkdir(parents=True, exist_ok=True)
     section_files = sorted(SECTIONS_DIR.glob("section_*.md"))
 
+    # Automatically substitute Member 1's merged `report/section_2_2_eda.md` for Section 2!
+    m1_eda = REPORT_DIR / "section_2_2_eda.md"
+    resolved_sections: list[Path] = []
+    for sec in section_files:
+        if sec.name == "section_02_eda.md" and m1_eda.exists():
+            resolved_sections.append(m1_eda)
+        else:
+            resolved_sections.append(sec)
+
     with PdfPages(str(output_pdf)) as pdf:
         writer = _A4PdfWriter(pdf)
         writer.draw_cover()
 
-        for sec_path in section_files:
+        for sec_path in resolved_sections:
             blocks = _parse_markdown_blocks(sec_path.read_text(encoding="utf-8"), base_dir=REPORT_DIR)
             for block in blocks:
                 btype = block["type"]
@@ -603,6 +665,8 @@ def build_technical_report(output_pdf: Path = OUTPUT_PDF) -> Path:
                     writer.draw_h3(block["text"])
                 elif btype == "bullet":
                     writer.draw_paragraph(block["text"], indent=0.026, prefix=block["prefix"])
+                elif btype == "code":
+                    writer.draw_code(block["text"])
                 elif btype == "table":
                     writer.draw_table(block["rows"])
                 elif btype == "image":

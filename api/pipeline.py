@@ -1,26 +1,21 @@
 """End-to-end map-matching pipeline orchestrator & Contract 1-3 adapter (Member 4).
 
-Supports the real repository dataset layout:
-    data/Student folder/student_test/<trip_id>/
-        <trip_id>.nodes   (tab-separated: lon, lat; 0-indexed node_id = line index)
-        <trip_id>.arcs    (tab-separated: from_node, to_node; 0-indexed arc_id = line index)
-        <trip_id>.track   (tab-separated: lon, lat, timestamp)
-        <trip_id>.route   (one ground-truth arc_id per line in chronological order)
-
-Plug-and-play integration (zero merge conflicts with P1/P2/P3):
-  - Automatically detects and delegates to:
-      * Member 1: `src.data_loader`, `src.candidate_gen`
-      * Member 2: `src.features`, `artifacts/best_model.pkl`
-      * Member 3: `src.hmm_viterbi.reconstruct_route(trip_id, gps_points, graph)`
-  - When teammate modules are not yet merged, executes a fast NumPy spatial-grid
-    candidate matcher + Gaussian/heading emission scorer + bounded-Dijkstra log-space
-    HMM Viterbi decoder directly on the real per-trip road graphs!
+Integrates directly with merged teammate modules while maintaining clean fallbacks:
+  - Member 1 (`src.data_loader`, `src.candidate_gen`):
+      Uses `load_trip`, `build_road_graph`, `SpatialCandidateGenerator` (STRtree/KDTree),
+      and `align_trajectory_to_route` directly on `data/Student folder/student_test/`.
+  - Member 2 (`src.features`, `artifacts/best_model.pkl`):
+      Automatically delegates emission scoring when merged.
+  - Member 3 (`src.hmm_viterbi.reconstruct_route`):
+      Automatically delegates sequential decoding via Contract 3 when merged;
+      otherwise runs a bounded-Dijkstra log-space HMM Viterbi decoder.
 """
 
 from __future__ import annotations
 
 import importlib
 import inspect
+import logging
 import math
 import pickle
 import time
@@ -30,6 +25,7 @@ from typing import Any, Sequence
 
 import networkx as nx
 import numpy as np
+import pandas as pd
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -78,7 +74,7 @@ def _collapse_consecutive(seq: Sequence[int]) -> list[int]:
 
 
 def _safe_import(module_name: str) -> Any | None:
-    """Import an optional teammate module without raising if absent."""
+    """Import an optional teammate module without raising if absent or missing deps."""
     try:
         return importlib.import_module(module_name)
     except Exception:
@@ -87,7 +83,7 @@ def _safe_import(module_name: str) -> Any | None:
 
 @dataclass
 class ComponentStatus:
-    """Tracks which teammate modules, dataset files, and model artifacts are wired."""
+    """Tracks which teammate modules, dataset files, and model artifacts are actively wired."""
 
     data_loader: bool = False
     candidate_gen: bool = False
@@ -136,11 +132,7 @@ class ComponentStatus:
 
 
 class _SpatialArcIndex:
-    """Fast pure-NumPy spatial grid index + vectorized segment projection for road arcs.
-
-    Handles 56,000+ road arcs and 4,000+ GPS points in tens of milliseconds without
-    requiring external C spatial libraries.
-    """
+    """Fallback pure-NumPy spatial grid index used when Shapely/SciPy aren't installed."""
 
     def __init__(
         self,
@@ -164,7 +156,6 @@ class _SpatialArcIndex:
         self.bearings_deg = bearings_deg
         self.cell_deg = cell_deg
 
-        # Build bounding-box grid buckets so long highway arcs appear in every cell they cross
         buckets: dict[tuple[int, int], list[int]] = {}
         min_r = np.floor(np.minimum(u_lats, v_lats) / cell_deg).astype(np.int64)
         max_r = np.floor(np.maximum(u_lats, v_lats) / cell_deg).astype(np.int64)
@@ -174,11 +165,8 @@ class _SpatialArcIndex:
         for aid in range(len(u_lats)):
             r0, r1 = int(min_r[aid]), int(max_r[aid])
             c0, c1 = int(min_c[aid]), int(max_c[aid])
-            # Guard against huge span artifacts
             if (r1 - r0) * (c1 - c0) > 400:
-                mid_r = (r0 + r1) // 2
-                mid_c = (c0 + c1) // 2
-                buckets.setdefault((mid_r, mid_c), []).append(aid)
+                buckets.setdefault(((r0 + r1) // 2, (c0 + c1) // 2), []).append(aid)
                 continue
             for r in range(r0, r1 + 1):
                 for c in range(c0, c1 + 1):
@@ -196,11 +184,9 @@ class _SpatialArcIndex:
         k: int = 8,
         max_radius_m: float = 120.0,
     ) -> list[dict[str, Any]]:
-        """Query top-K nearest directed arcs to (lat, lon) with vectorized metric projection."""
         cr = int(math.floor(lat / self.cell_deg))
         cc = int(math.floor(lon / self.cell_deg))
 
-        # Gather candidate arc IDs from 3x3 neighborhood (expand to 5x5 if sparse)
         cand_arrays: list[np.ndarray] = []
         for dr in (-1, 0, 1):
             for dc in (-1, 0, 1):
@@ -215,23 +201,18 @@ class _SpatialArcIndex:
                     if arr is not None:
                         cand_arrays.append(arr)
 
-        if cand_arrays:
-            cand_ids = np.unique(np.concatenate(cand_arrays))
-        else:
-            # Ultimate fallback: full scan
-            cand_ids = np.arange(len(self.u_lats), dtype=np.int32)
-
+        cand_ids = (
+            np.unique(np.concatenate(cand_arrays))
+            if cand_arrays
+            else np.arange(len(self.u_lats), dtype=np.int32)
+        )
         dists, fracs = self._vectorized_point_to_segments(lat, lon, cand_ids)
 
         within = np.where(dists <= max_radius_m)[0]
         if len(within) >= min(k, 2):
-            sub_ids = cand_ids[within]
-            sub_dists = dists[within]
-            sub_fracs = fracs[within]
+            sub_ids, sub_dists, sub_fracs = cand_ids[within], dists[within], fracs[within]
         else:
-            sub_ids = cand_ids
-            sub_dists = dists
-            sub_fracs = fracs
+            sub_ids, sub_dists, sub_fracs = cand_ids, dists, fracs
 
         if len(sub_ids) > k:
             top_idx = np.argpartition(sub_dists, k)[:k]
@@ -242,7 +223,6 @@ class _SpatialArcIndex:
         results: list[dict[str, Any]] = []
         for idx in top_idx:
             aid = int(sub_ids[idx])
-            hd = _angular_diff_deg(gps_heading, float(self.bearings_deg[aid]))
             results.append(
                 {
                     "arc_id": aid,
@@ -251,7 +231,7 @@ class _SpatialArcIndex:
                     "length": float(self.lengths_m[aid]),
                     "distance_m": float(sub_dists[idx]),
                     "proj_frac": float(sub_fracs[idx]),
-                    "heading_delta_deg": hd,
+                    "heading_delta_deg": _angular_diff_deg(gps_heading, float(self.bearings_deg[aid])),
                 }
             )
         return results
@@ -261,9 +241,7 @@ class _SpatialArcIndex:
         gps_points: Sequence[dict[str, Any]],
         max_arcs: int = 1200,
     ) -> list[int]:
-        """Collect road network arcs near the trajectory corridor for fast Folium Layer 2."""
         seen: set[int] = set()
-        # Sample corridor cells along the track
         stride = max(1, len(gps_points) // 250)
         for pt in gps_points[::stride]:
             cr = int(math.floor(float(pt["lat"]) / self.cell_deg))
@@ -281,7 +259,6 @@ class _SpatialArcIndex:
     def _vectorized_point_to_segments(
         self, lat: float, lon: float, arc_ids: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Vectorized local-metric perpendicular distance (m) and projection fraction."""
         cos_lat = math.cos(math.radians(lat))
         m_lat = 111_132.0
         m_lon = 111_320.0 * cos_lat
@@ -299,9 +276,7 @@ class _SpatialArcIndex:
         seg_len_sq = dx * dx + dy * dy
         safe_denom = np.where(seg_len_sq > 1e-9, seg_len_sq, 1.0)
         t = np.where(seg_len_sq > 1e-9, np.clip((px * dx + py * dy) / safe_denom, 0.0, 1.0), 0.0)
-        rx = px - t * dx
-        ry = py - t * dy
-        return np.hypot(rx, ry), t
+        return np.hypot(px - t * dx, py - t * dy), t
 
 
 @dataclass
@@ -314,7 +289,14 @@ class TripBundle:
     arc_lookup: dict[int, dict[str, Any]]
     spatial_index: _SpatialArcIndex
     gps_points: list[dict[str, Any]]
-    ground_truth_route: list[int]  # Chronological sequence of traversed GT arc_ids
+    ground_truth_route: list[int]
+    # Optional Member 1 native objects when src.data_loader & src.candidate_gen are active
+    track_df: pd.DataFrame | None = None
+    nodes_df: pd.DataFrame | None = None
+    arcs_df: pd.DataFrame | None = None
+    aug_arcs_df: pd.DataFrame | None = None
+    route_df: pd.DataFrame | None = None
+    p1_candidate_gen: Any | None = None
 
 
 class MapMatchingPipeline:
@@ -335,15 +317,9 @@ class MapMatchingPipeline:
         self._p2_features: Any | None = None
         self._p3_hmm: Any | None = None
 
-        # Metadata for all evaluation trips (loaded at startup without parsing huge graphs yet)
         self.eval_trip_dirs: dict[str, Path] = {}
         self.eval_trip_meta: dict[str, dict[str, Any]] = {}
-        # Cached loaded TripBundle per trip_id
         self._bundle_cache: dict[str, TripBundle] = {}
-
-        # Legacy single-graph attributes for backward compatibility if inspected directly
-        self.graph: nx.DiGraph = nx.DiGraph()
-        self.eval_trips: dict[str, dict[str, Any]] = {}
 
         self._initialize()
 
@@ -356,8 +332,15 @@ class MapMatchingPipeline:
         self._p2_features = _safe_import("src.features")
         self._p3_hmm = _safe_import("src.hmm_viterbi")
 
-        self.status.data_loader = self._p1_loader is not None
-        self.status.candidate_gen = self._p1_cand is not None
+        self.status.data_loader = bool(
+            self._p1_loader is not None
+            and hasattr(self._p1_loader, "load_trip")
+            and hasattr(self._p1_loader, "build_road_graph")
+        )
+        self.status.candidate_gen = bool(
+            self._p1_cand is not None
+            and hasattr(self._p1_cand, "SpatialCandidateGenerator")
+        )
         self.status.features = self._p2_features is not None
         self.status.hmm_viterbi = bool(
             self._p3_hmm is not None and hasattr(self._p3_hmm, "reconstruct_route")
@@ -384,7 +367,6 @@ class MapMatchingPipeline:
                 return None
 
     def _find_student_test_dir(self) -> Path | None:
-        """Locate the `student_test` evaluation directory inside `data/`."""
         candidates = [
             self.data_dir / "Student folder" / "student_test",
             self.data_dir / "student_test",
@@ -393,7 +375,6 @@ class MapMatchingPipeline:
         for cand in candidates:
             if cand.exists() and cand.is_dir():
                 return cand
-        # Recursive search fallback
         if self.data_dir.exists():
             for match in self.data_dir.rglob("student_test"):
                 if match.is_dir():
@@ -420,8 +401,9 @@ class MapMatchingPipeline:
             if not (nodes_f.exists() and arcs_f.exists() and track_f.exists()):
                 continue
 
-            # Lightweight metadata scan (fast line counts + track duration)
-            track_lines = [l for l in track_f.read_text(encoding="utf-8", errors="ignore").splitlines() if l.strip()]
+            track_lines = [
+                l for l in track_f.read_text(encoding="utf-8", errors="ignore").splitlines() if l.strip()
+            ]
             num_nodes = sum(1 for l in nodes_f.open("r", encoding="utf-8", errors="ignore") if l.strip())
             num_arcs = sum(1 for l in arcs_f.open("r", encoding="utf-8", errors="ignore") if l.strip())
 
@@ -462,110 +444,166 @@ class MapMatchingPipeline:
         return True
 
     def _load_real_trip_bundle(self, trip_id: str) -> TripBundle:
-        """Load and cache a real per-trip road graph, spatial index, track, and GT route."""
+        """Load and cache a real per-trip road graph using Member 1's `src.data_loader`."""
         if trip_id in self._bundle_cache:
             return self._bundle_cache[trip_id]
 
         trip_dir = self.eval_trip_dirs[trip_id]
-        nodes_f = trip_dir / f"{trip_id}.nodes"
-        arcs_f = trip_dir / f"{trip_id}.arcs"
-        track_f = trip_dir / f"{trip_id}.track"
-        route_f = trip_dir / f"{trip_id}.route"
 
-        # 1. Parse .nodes (col0=lon, col1=lat, 0-indexed node_id = line index)
-        nodes_arr = np.loadtxt(str(nodes_f), dtype=np.float64)
+        # Prefer Member 1's official `src.data_loader.load_trip` & `build_road_graph`
+        if self.status.data_loader and self._p1_loader is not None:
+            trip_data = self._p1_loader.load_trip(trip_id, base_dirs=[str(trip_dir.parent)])
+            track_df: pd.DataFrame = trip_data["track"]
+            nodes_df: pd.DataFrame = trip_data["nodes"]
+            arcs_df: pd.DataFrame = trip_data["arcs"]
+            route_df: pd.DataFrame | None = trip_data["route"]
+
+            origin_lon = float(nodes_df["lon"].mean())
+            origin_lat = float(nodes_df["lat"].mean())
+            graph, aug_arcs = self._p1_loader.build_road_graph(
+                nodes_df, arcs_df, origin_lon=origin_lon, origin_lat=origin_lat
+            )
+
+            u_lats = aug_arcs["u_lat"].values
+            u_lons = aug_arcs["u_lon"].values
+            v_lats = aug_arcs["v_lat"].values
+            v_lons = aug_arcs["v_lon"].values
+            from_nodes = aug_arcs["from_node"].values
+            to_nodes = aug_arcs["to_node"].values
+            lengths_m = aug_arcs["arc_length"].values
+            bearings_deg = aug_arcs["bearing"].values
+
+            arc_lookup: dict[int, dict[str, Any]] = {}
+            for aid in range(len(aug_arcs)):
+                arc_lookup[aid] = {
+                    "arc_id": aid,
+                    "from_node": int(from_nodes[aid]),
+                    "to_node": int(to_nodes[aid]),
+                    "length": round(float(lengths_m[aid]), 2),
+                    "coords": [
+                        [float(u_lats[aid]), float(u_lons[aid])],
+                        [float(v_lats[aid]), float(v_lons[aid])],
+                    ],
+                }
+
+            spatial_index = _SpatialArcIndex(
+                u_lats=u_lats,
+                u_lons=u_lons,
+                v_lats=v_lats,
+                v_lons=v_lons,
+                from_nodes=from_nodes,
+                to_nodes=to_nodes,
+                lengths_m=lengths_m,
+                bearings_deg=bearings_deg,
+            )
+
+            p1_gen = None
+            if self.status.candidate_gen and self._p1_cand is not None:
+                try:
+                    p1_gen = self._p1_cand.SpatialCandidateGenerator(
+                        aug_arcs,
+                        origin_lon=origin_lon,
+                        origin_lat=origin_lat,
+                        index_type="strtree",
+                    )
+                except Exception as exc:
+                    logging.getLogger("map_matching_api").warning(
+                        "SpatialCandidateGenerator init failed (%s); using NumPy spatial index.", exc
+                    )
+
+            gps_points = [
+                {
+                    "step_idx": int(row.step_idx),
+                    "timestamp": round(float(row.timestamp), 2),
+                    "lat": float(row.lat),
+                    "lon": float(row.lon),
+                }
+                for row in track_df.itertuples()
+            ]
+            gt_route = (
+                [int(a) for a in route_df["arc_id"].values]
+                if route_df is not None
+                else []
+            )
+
+            bundle = TripBundle(
+                trip_id=trip_id,
+                description=self.eval_trip_meta[trip_id]["description"],
+                graph=graph,
+                arc_lookup=arc_lookup,
+                spatial_index=spatial_index,
+                gps_points=gps_points,
+                ground_truth_route=gt_route,
+                track_df=track_df,
+                nodes_df=nodes_df,
+                arcs_df=arcs_df,
+                aug_arcs_df=aug_arcs,
+                route_df=route_df,
+                p1_candidate_gen=p1_gen,
+            )
+            self._bundle_cache[trip_id] = bundle
+            return bundle
+
+        # Fallback loader if src.data_loader is not available
+        nodes_arr = np.loadtxt(str(trip_dir / f"{trip_id}.nodes"), dtype=np.float64)
         if nodes_arr.ndim == 1:
             nodes_arr = nodes_arr.reshape(1, -1)
-        node_lons = nodes_arr[:, 0]
-        node_lats = nodes_arr[:, 1]
+        node_lons, node_lats = nodes_arr[:, 0], nodes_arr[:, 1]
 
-        # 2. Parse .arcs (col0=from_node, col1=to_node, 0-indexed arc_id = line index)
-        arcs_arr = np.loadtxt(str(arcs_f), dtype=np.int64)
+        arcs_arr = np.loadtxt(str(trip_dir / f"{trip_id}.arcs"), dtype=np.int64)
         if arcs_arr.ndim == 1:
             arcs_arr = arcs_arr.reshape(1, -1)
-        from_nodes = arcs_arr[:, 0]
-        to_nodes = arcs_arr[:, 1]
+        from_nodes, to_nodes = arcs_arr[:, 0], arcs_arr[:, 1]
 
-        u_lats = node_lats[from_nodes]
-        u_lons = node_lons[from_nodes]
-        v_lats = node_lats[to_nodes]
-        v_lons = node_lons[to_nodes]
+        u_lats, u_lons = node_lats[from_nodes], node_lons[from_nodes]
+        v_lats, v_lons = node_lats[to_nodes], node_lons[to_nodes]
 
-        # Vectorized Haversine arc lengths (meters) & bearings (degrees)
-        phi1 = np.radians(u_lats)
-        phi2 = np.radians(v_lats)
-        dphi = np.radians(v_lats - u_lats)
-        dlam = np.radians(v_lons - u_lons)
+        phi1, phi2 = np.radians(u_lats), np.radians(v_lats)
+        dphi, dlam = np.radians(v_lats - u_lats), np.radians(v_lons - u_lons)
         a = np.sin(dphi / 2.0) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlam / 2.0) ** 2
         lengths_m = 2.0 * EARTH_RADIUS_M * np.arctan2(np.sqrt(a), np.sqrt(np.clip(1.0 - a, 0.0, 1.0)))
-
         by = np.sin(dlam) * np.cos(phi2)
         bx = np.cos(phi1) * np.sin(phi2) - np.sin(phi1) * np.cos(phi2) * np.cos(dlam)
         bearings_deg = (np.degrees(np.arctan2(by, bx)) + 360.0) % 360.0
 
-        # Build NetworkX DiGraph (compatible with Contract 3 `reconstruct_route(trip_id, gps_points, graph)`)
         graph = nx.DiGraph()
         graph.add_nodes_from(
             (i, {"lat": float(node_lats[i]), "lon": float(node_lons[i])})
             for i in range(len(node_lats))
         )
-
-        arc_lookup: dict[int, dict[str, Any]] = {}
+        arc_lookup = {}
         edges_to_add = []
         for aid in range(len(from_nodes)):
-            u = int(from_nodes[aid])
-            v = int(to_nodes[aid])
+            u, v = int(from_nodes[aid]), int(to_nodes[aid])
             length = float(lengths_m[aid])
             coords = [[float(u_lats[aid]), float(u_lons[aid])], [float(v_lats[aid]), float(v_lons[aid])]]
-            edges_to_add.append(
-                (u, v, {"arc_id": aid, "length": length, "weight": length, "coords": coords})
-            )
-            arc_lookup[aid] = {
-                "arc_id": aid,
-                "from_node": u,
-                "to_node": v,
-                "length": round(length, 2),
-                "coords": coords,
-            }
+            edges_to_add.append((u, v, {"arc_id": aid, "length": length, "weight": length, "coords": coords}))
+            arc_lookup[aid] = {"arc_id": aid, "from_node": u, "to_node": v, "length": round(length, 2), "coords": coords}
         graph.add_edges_from(edges_to_add)
 
         spatial_index = _SpatialArcIndex(
-            u_lats=u_lats,
-            u_lons=u_lons,
-            v_lats=v_lats,
-            v_lons=v_lons,
-            from_nodes=from_nodes,
-            to_nodes=to_nodes,
-            lengths_m=lengths_m,
-            bearings_deg=bearings_deg,
+            u_lats=u_lats, u_lons=u_lons, v_lats=v_lats, v_lons=v_lons,
+            from_nodes=from_nodes, to_nodes=to_nodes, lengths_m=lengths_m, bearings_deg=bearings_deg,
         )
 
-        # 3. Parse .track (col0=lon, col1=lat, col2=timestamp)
-        track_arr = np.loadtxt(str(track_f), dtype=np.float64)
+        track_arr = np.loadtxt(str(trip_dir / f"{trip_id}.track"), dtype=np.float64)
         if track_arr.ndim == 1:
             track_arr = track_arr.reshape(1, -1)
-        gps_points: list[dict[str, Any]] = []
-        for idx in range(len(track_arr)):
-            lon = float(track_arr[idx, 0])
-            lat = float(track_arr[idx, 1])
-            ts = float(track_arr[idx, 2]) if track_arr.shape[1] >= 3 else float(idx)
-            gps_points.append(
-                {
-                    "step_idx": idx,
-                    "timestamp": round(ts, 2),
-                    "lat": lat,
-                    "lon": lon,
-                }
-            )
-
-        # 4. Parse .route (chronological ground-truth arc_ids — kept strictly server-side)
-        gt_route: list[int] = []
-        if route_f.exists():
-            gt_route = [
-                int(line.strip().split()[0])
-                for line in route_f.read_text(encoding="utf-8", errors="ignore").splitlines()
-                if line.strip()
-            ]
+        gps_points = [
+            {
+                "step_idx": idx,
+                "timestamp": round(float(track_arr[idx, 2]) if track_arr.shape[1] >= 3 else float(idx), 2),
+                "lat": float(track_arr[idx, 1]),
+                "lon": float(track_arr[idx, 0]),
+            }
+            for idx in range(len(track_arr))
+        ]
+        route_f = trip_dir / f"{trip_id}.route"
+        gt_route = (
+            [int(line.strip().split()[0]) for line in route_f.read_text(encoding="utf-8", errors="ignore").splitlines() if line.strip()]
+            if route_f.exists()
+            else []
+        )
 
         bundle = TripBundle(
             trip_id=trip_id,
@@ -580,10 +618,9 @@ class MapMatchingPipeline:
         return bundle
 
     # ------------------------------------------------------------------
-    # Synthetic fallback (only used if `data/` has no real files)
+    # Minimal synthetic fallback (only if `data/` is absent)
     # ------------------------------------------------------------------
     def _build_synthetic_fallback(self) -> None:
-        """Minimal synthetic fallback when no dataset files exist in `data/`."""
         rng = np.random.default_rng(seed=42)
         rows, cols = 10, 12
         base_lat, base_lon = 12.9640, 77.5840
@@ -597,8 +634,7 @@ class MapMatchingPipeline:
                 nid = r * cols + c
                 lat = base_lat + r * step_lat + float(rng.normal(0.0, 0.00008))
                 lon = base_lon + c * step_lon + float(rng.normal(0.0, 0.00008))
-                node_lats[nid] = lat
-                node_lons[nid] = lon
+                node_lats[nid], node_lons[nid] = lat, lon
                 graph.add_node(nid, lat=lat, lon=lon)
 
         from_list, to_list = [], []
@@ -635,29 +671,21 @@ class MapMatchingPipeline:
             arc_lookup[aid] = {"arc_id": aid, "from_node": u, "to_node": v, "length": round(float(lengths_m[aid]), 2), "coords": coords}
 
         spatial_index = _SpatialArcIndex(
-            u_lats=u_lats,
-            u_lons=u_lons,
-            v_lats=v_lats,
-            v_lons=v_lons,
-            from_nodes=from_nodes,
-            to_nodes=to_nodes,
-            lengths_m=lengths_m,
-            bearings_deg=bearings_deg,
+            u_lats=u_lats, u_lons=u_lons, v_lats=v_lats, v_lons=v_lons,
+            from_nodes=from_nodes, to_nodes=to_nodes, lengths_m=lengths_m, bearings_deg=bearings_deg,
         )
 
         for idx in range(1, 11):
             tid = f"eval_trip_{idx:02d}"
             trng = np.random.default_rng(100 + idx)
-            curr = idx % len(node_lats)
-            prev = -1
+            curr, prev = idx % len(node_lats), -1
             route: list[int] = []
             gps_points: list[dict[str, Any]] = []
             ts = 0.0
             for _ in range(14):
                 nbrs = [n for n in graph.successors(curr) if n != prev] or list(graph.successors(curr))
                 nxt = int(trng.choice(nbrs))
-                aid = int(graph[curr][nxt]["arc_id"])
-                route.append(aid)
+                route.append(int(graph[curr][nxt]["arc_id"]))
                 for frac in (0.2, 0.55, 0.85):
                     lat = node_lats[curr] + frac * (node_lats[nxt] - node_lats[curr]) + float(trng.normal(0, 7.0)) / 111_132.0
                     lon = node_lons[curr] + frac * (node_lons[nxt] - node_lons[curr]) + float(trng.normal(0, 7.0)) / (111_320.0 * math.cos(math.radians(node_lats[curr])))
@@ -695,7 +723,6 @@ class MapMatchingPipeline:
     # Public inspection helpers
     # ------------------------------------------------------------------
     def list_eval_trips(self) -> list[dict[str, Any]]:
-        """Return safe metadata for the 10 evaluation trips (zero GT leakage)."""
         return [
             {
                 "trip_id": tid,
@@ -727,19 +754,11 @@ class MapMatchingPipeline:
         }
 
     # ------------------------------------------------------------------
-    # Stage 2, 3, 4: Candidates -> Classifier -> HMM Viterbi
+    # Stage 2: Candidate Generation (uses Member 1's SpatialCandidateGenerator!)
     # ------------------------------------------------------------------
-    def _generate_candidates(
-        self,
-        bundle: TripBundle,
-        k: int = 8,
-        max_radius_m: float = 120.0,
-    ) -> list[list[dict[str, Any]]]:
-        gps_points = bundle.gps_points
+    @staticmethod
+    def _compute_smoothed_headings(gps_points: Sequence[dict[str, Any]]) -> list[float]:
         n = len(gps_points)
-        candidates_per_step: list[list[dict[str, Any]]] = []
-
-        # Precompute smoothed GPS headings over a small window for robustness to jitter
         headings: list[float] = []
         for idx in range(n):
             i0 = max(0, idx - 1)
@@ -753,7 +772,86 @@ class MapMatchingPipeline:
                 headings.append(headings[-1])
             else:
                 headings.append(_bearing_deg(lat0, lon0, lat1, lon1))
+        return headings
 
+    def _generate_candidates(
+        self,
+        bundle: TripBundle,
+        k: int = 8,
+        max_radius_m: float = 120.0,
+    ) -> tuple[list[list[dict[str, Any]]], pd.DataFrame | None]:
+        """Generate candidate arcs using Member 1's STRtree `SpatialCandidateGenerator` if active."""
+        gps_points = bundle.gps_points
+        headings = self._compute_smoothed_headings(gps_points)
+
+        # Native Member 1 Contract 1 pipeline
+        if (
+            bundle.p1_candidate_gen is not None
+            and bundle.track_df is not None
+            and bundle.aug_arcs_df is not None
+        ):
+            cands_df: pd.DataFrame = bundle.p1_candidate_gen.generate_candidates(
+                trip_id=bundle.trip_id,
+                track_df=bundle.track_df,
+                route_df=None,  # Keep GT strictly isolated during inference!
+                k=k,
+                max_distance=max_radius_m,
+            )
+
+            # Vectorized projection fraction & heading delta enrichment for HMM
+            cand_aids = cands_df["arc_id"].values
+            step_ids = cands_df["step_idx"].values
+            aug = bundle.aug_arcs_df
+            u_x = aug["u_x"].values[cand_aids]
+            u_y = aug["u_y"].values[cand_aids]
+            v_x = aug["v_x"].values[cand_aids]
+            v_y = aug["v_y"].values[cand_aids]
+            arc_bearings = aug["bearing"].values[cand_aids]
+
+            # Project GPS points into the same local metric coordinates
+            gps_x, gps_y = self._p1_loader.wgs84_to_local_metric(
+                cands_df["gps_lon"].values,
+                cands_df["gps_lat"].values,
+                origin_lon=bundle.p1_candidate_gen.origin_lon,
+                origin_lat=bundle.p1_candidate_gen.origin_lat,
+            )
+            dx = v_x - u_x
+            dy = v_y - u_y
+            seg_len_sq = dx * dx + dy * dy
+            safe_denom = np.where(seg_len_sq > 1e-9, seg_len_sq, 1.0)
+            proj_fracs = np.where(
+                seg_len_sq > 1e-9,
+                np.clip(((gps_x - u_x) * dx + (gps_y - u_y) * dy) / safe_denom, 0.0, 1.0),
+                0.0,
+            )
+
+            headings_arr = np.array(headings, dtype=np.float64)[step_ids]
+            raw_hd = np.abs(headings_arr - arc_bearings) % 360.0
+            hd_deg = np.minimum(raw_hd, 360.0 - raw_hd)
+
+            from_nodes = cands_df["from_node"].values
+            to_nodes = cands_df["to_node"].values
+            lengths = cands_df["arc_length"].values
+            dists = cands_df["dist_to_arc"].values
+
+            candidates_per_step: list[list[dict[str, Any]]] = [[] for _ in range(len(gps_points))]
+            for idx in range(len(cands_df)):
+                s_idx = int(step_ids[idx])
+                candidates_per_step[s_idx].append(
+                    {
+                        "arc_id": int(cand_aids[idx]),
+                        "from_node": int(from_nodes[idx]),
+                        "to_node": int(to_nodes[idx]),
+                        "length": float(lengths[idx]),
+                        "distance_m": float(dists[idx]),
+                        "proj_frac": float(proj_fracs[idx]),
+                        "heading_delta_deg": float(hd_deg[idx]),
+                    }
+                )
+            return candidates_per_step, cands_df
+
+        # Fallback NumPy spatial index
+        candidates_per_step = []
         for idx, pt in enumerate(gps_points):
             cands = bundle.spatial_index.query_point(
                 lat=float(pt["lat"]),
@@ -763,31 +861,42 @@ class MapMatchingPipeline:
                 max_radius_m=max_radius_m,
             )
             candidates_per_step.append(cands)
-        return candidates_per_step
+        return candidates_per_step, None
 
+    # ------------------------------------------------------------------
+    # Stage 3: Classifier Emission Scoring (Contract 2)
+    # ------------------------------------------------------------------
     def _score_candidates(
         self,
         bundle: TripBundle,
         candidates_per_step: list[list[dict[str, Any]]],
+        candidates_df: pd.DataFrame | None = None,
     ) -> tuple[list[list[float]], list[int]]:
-        """Compute emission probabilities and greedy Classifier-only Top-1 predictions."""
+        """Score candidate arcs using Member 2's model if present, else Gaussian/Heading emissions."""
         if self.model is not None and self._p2_features is not None:
             for fn_name in ("extract_features", "compute_features", "build_features"):
                 feat_fn = getattr(self._p2_features, fn_name, None)
                 if callable(feat_fn):
                     try:
-                        all_probs: list[list[float]] = []
-                        greedy_ids: list[int] = []
-                        for step_cands in candidates_per_step:
-                            X = feat_fn(step_cands, bundle.graph)
-                            probs = self.model.predict_proba(X)[:, 1].tolist()
-                            all_probs.append([float(p) for p in probs])
-                            greedy_ids.append(int(step_cands[int(np.argmax(probs))]["arc_id"]))
-                        return all_probs, greedy_ids
-                    except Exception:
+                        if candidates_df is not None:
+                            X = feat_fn(candidates_df, bundle.graph)
+                            probs_flat = self.model.predict_proba(X)[:, 1]
+                            all_probs: list[list[float]] = []
+                            greedy_ids: list[int] = []
+                            cursor = 0
+                            for step_cands in candidates_per_step:
+                                m = len(step_cands)
+                                step_p = [float(p) for p in probs_flat[cursor : cursor + m]]
+                                cursor += m
+                                all_probs.append(step_p)
+                                greedy_ids.append(int(step_cands[int(np.argmax(step_p))]["arc_id"]))
+                            return all_probs, greedy_ids
+                    except Exception as exc:
+                        logging.getLogger("map_matching_api").warning(
+                            "Member 2 feature/model scoring raised %s; using Gaussian emissions.", exc
+                        )
                         break
 
-        # Fallback Gaussian distance + heading emission likelihood (Contract 2 compatible)
         sigma_dist = 12.0
         sigma_head = 50.0
         all_probs = []
@@ -809,6 +918,9 @@ class MapMatchingPipeline:
 
         return all_probs, greedy_ids
 
+    # ------------------------------------------------------------------
+    # Stage 4: HMM Viterbi Decoding (Contract 3)
+    # ------------------------------------------------------------------
     def _run_hmm_viterbi(
         self,
         bundle: TripBundle,
@@ -831,8 +943,6 @@ class MapMatchingPipeline:
                 if isinstance(result, (list, tuple)) and len(result) > 0:
                     return [int(a) for a in result]
             except Exception as exc:
-                import logging
-
                 logging.getLogger("map_matching_api").warning(
                     "Member 3 reconstruct_route raised %s; falling back to built-in Viterbi.", exc
                 )
@@ -844,7 +954,6 @@ class MapMatchingPipeline:
 
         beta = 25.0
         graph = bundle.graph
-        # Bounded single-source Dijkstra cache: source_node -> {target_node: dist_m}
         sssp_cache: dict[int, dict[int, float]] = {}
 
         def bounded_net_dist(src: int, dst: int, cutoff: float) -> float:
@@ -901,7 +1010,6 @@ class MapMatchingPipeline:
                         c_prev["from_node"] == c_curr["to_node"]
                         and c_prev["to_node"] == c_curr["from_node"]
                     ):
-                        # U-turn penalty
                         trans_pen = -14.0
                     else:
                         sp = bounded_net_dist(c_prev["to_node"], c_curr["from_node"], cutoff)
@@ -919,7 +1027,6 @@ class MapMatchingPipeline:
                 curr_dp.append(best_score)
                 curr_bp.append(best_prev)
 
-            # Reset guard against complete underflow on severe GPS dropouts
             if max(curr_dp) < -1e6:
                 curr_dp = [math.log(max(p, 1e-12)) for p in emission_probs[t]]
 
@@ -938,7 +1045,35 @@ class MapMatchingPipeline:
     # Stage 5: Server-side GT Alignment & Metrics
     # ------------------------------------------------------------------
     def _align_gt_per_step(self, bundle: TripBundle) -> list[int | None]:
-        """Align each GPS observation to its nearest arc within the ground-truth `.route`."""
+        """Chronologically align each GPS observation to the ground-truth `.route`."""
+        # Prefer Member 1's chronological forward-tracking alignment when available
+        if (
+            self._p1_cand is not None
+            and hasattr(self._p1_cand, "align_trajectory_to_route")
+            and bundle.track_df is not None
+            and bundle.route_df is not None
+            and bundle.aug_arcs_df is not None
+            and bundle.p1_candidate_gen is not None
+        ):
+            try:
+                tdf = bundle.track_df
+                if "x" not in tdf.columns or "y" not in tdf.columns:
+                    tx, ty = self._p1_loader.wgs84_to_local_metric(
+                        tdf["lon"].values,
+                        tdf["lat"].values,
+                        origin_lon=bundle.p1_candidate_gen.origin_lon,
+                        origin_lat=bundle.p1_candidate_gen.origin_lat,
+                    )
+                    tdf = tdf.copy()
+                    tdf["x"] = tx
+                    tdf["y"] = ty
+                aligned = self._p1_cand.align_trajectory_to_route(
+                    tdf, bundle.route_df, bundle.aug_arcs_df
+                )
+                return [int(a) for a in aligned]
+            except Exception:
+                pass
+
         gt_route = bundle.ground_truth_route
         if not gt_route:
             return [None] * len(bundle.gps_points)
@@ -947,16 +1082,15 @@ class MapMatchingPipeline:
         if len(valid_gt) == 0:
             return [None] * len(bundle.gps_points)
 
-        aligned: list[int | None] = []
+        aligned_list: list[int | None] = []
         for pt in bundle.gps_points:
             dists, _ = bundle.spatial_index._vectorized_point_to_segments(
                 float(pt["lat"]), float(pt["lon"]), valid_gt
             )
-            aligned.append(int(valid_gt[int(np.argmin(dists))]))
-        return aligned
+            aligned_list.append(int(valid_gt[int(np.argmin(dists))]))
+        return aligned_list
 
     def _compute_continuity(self, bundle: TripBundle, arc_sequence: Sequence[int]) -> dict[str, Any]:
-        """Measure physical road-network continuity of consecutive distinct predicted arcs."""
         collapsed = _collapse_consecutive(arc_sequence)
         if len(collapsed) <= 1:
             return {
@@ -981,7 +1115,6 @@ class MapMatchingPipeline:
                 direct_transitions += 1
                 valid_transitions += 1
             else:
-                # Allow short connected bridge (<= 5 hops / <= 600m) when GPS skipped short intersections
                 try:
                     sp = nx.single_source_dijkstra_path_length(
                         graph, source=prev_rec["to_node"], cutoff=600.0, weight="length"
@@ -1003,7 +1136,6 @@ class MapMatchingPipeline:
     def _expand_route_with_bridges(
         self, bundle: TripBundle, raw_arc_seq: Sequence[int]
     ) -> list[int]:
-        """Bridge short missing road segments between consecutive matched arcs for route reconstruction."""
         collapsed = _collapse_consecutive(raw_arc_seq)
         if len(collapsed) <= 1:
             return collapsed
@@ -1024,7 +1156,6 @@ class MapMatchingPipeline:
                         target=curr_rec["from_node"],
                         weight="length",
                     )
-                    # Only insert bridge if physically short (<= 600m)
                     bridge_len = sum(
                         float(graph[u][v].get("length", 0.0))
                         for u, v in zip(path_nodes[:-1], path_nodes[1:])
@@ -1046,7 +1177,6 @@ class MapMatchingPipeline:
         greedy_step_arcs: Sequence[int],
         reconstructed_route: Sequence[int],
     ) -> dict[str, Any]:
-        """Compute Top-1 Accuracy, Route Continuity, Route F1, Length-Weighted F1, and HMM gains."""
         pred_cont = self._compute_continuity(bundle, reconstructed_route)
         greedy_cont = self._compute_continuity(bundle, greedy_step_arcs)
 
@@ -1054,7 +1184,6 @@ class MapMatchingPipeline:
         gt_set = set(gt_route)
         pred_set = set(reconstructed_route)
 
-        # Pointwise Top-1 Accuracy: fraction of GPS observations matched to the correct GT arc
         if len(pred_step_arcs) == len(gt_step_arcs) and len(pred_step_arcs) > 0:
             top1_acc = sum(
                 1 for g, p in zip(gt_step_arcs, pred_step_arcs) if (p == g or p in gt_set)
@@ -1076,7 +1205,6 @@ class MapMatchingPipeline:
         route_f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
         jaccard = tp / len(gt_set | pred_set) if (gt_set | pred_set) else 0.0
 
-        # Length-weighted Route F1 (GIS Cup standard metric)
         len_tp = sum(bundle.arc_lookup[a]["length"] for a in (gt_set & pred_set) if a in bundle.arc_lookup)
         len_pred = sum(bundle.arc_lookup[a]["length"] for a in pred_set if a in bundle.arc_lookup)
         len_gt = sum(bundle.arc_lookup[a]["length"] for a in gt_set if a in bundle.arc_lookup)
@@ -1114,21 +1242,24 @@ class MapMatchingPipeline:
         bundle = self.get_trip_bundle(trip_id)
         gps_points = bundle.gps_points
 
-        # Stage 2: Candidate generation (Spatial Index)
+        # Stage 2: Candidate generation (Member 1 STRtree SpatialCandidateGenerator)
         t0 = time.perf_counter()
-        candidates_per_step = self._generate_candidates(bundle, k=8, max_radius_m=120.0)
+        candidates_per_step, candidates_df = self._generate_candidates(
+            bundle, k=8, max_radius_m=120.0
+        )
         candidate_ms = (time.perf_counter() - t0) * 1000.0
         total_candidates = sum(len(c) for c in candidates_per_step)
 
-        # Stage 3: Classifier emission scoring
+        # Stage 3: Classifier emission scoring (Contract 2)
         t1 = time.perf_counter()
-        emission_probs, greedy_step_arcs = self._score_candidates(bundle, candidates_per_step)
+        emission_probs, greedy_step_arcs = self._score_candidates(
+            bundle, candidates_per_step, candidates_df=candidates_df
+        )
         inference_ms = (time.perf_counter() - t1) * 1000.0
 
-        # Stage 4: HMM Viterbi sequential route reconstruction
+        # Stage 4: HMM Viterbi sequential decoding (Contract 3)
         t2 = time.perf_counter()
         raw_pred_arcs = self._run_hmm_viterbi(bundle, candidates_per_step, emission_probs)
-        # Support P3 returning either per-step arcs or collapsed route arcs
         if len(raw_pred_arcs) == len(gps_points):
             pred_step_arcs = raw_pred_arcs
             reconstructed_route = self._expand_route_with_bridges(bundle, raw_pred_arcs)
@@ -1137,7 +1268,7 @@ class MapMatchingPipeline:
             reconstructed_route = _collapse_consecutive(raw_pred_arcs)
         viterbi_ms = (time.perf_counter() - t2) * 1000.0
 
-        # Stage 5: Server-side metrics & geometry packing
+        # Stage 5: Server-side ground-truth evaluation & geometry packing
         t3 = time.perf_counter()
         gt_step_arcs = self._align_gt_per_step(bundle)
         metrics = self._compute_metrics(
@@ -1155,7 +1286,6 @@ class MapMatchingPipeline:
         corridor_ids = bundle.spatial_index.query_corridor_arc_ids(gps_points, max_arcs=1100)
         local_road_arcs = [bundle.arc_lookup[a] for a in corridor_ids if a in bundle.arc_lookup]
 
-        # Build step details (cap huge 4k-row audit tables smoothly if needed while keeping all gps_points)
         step_details: list[dict[str, Any]] = []
         aligned_pred = len(pred_step_arcs) == len(gps_points)
         for idx, pt in enumerate(gps_points):

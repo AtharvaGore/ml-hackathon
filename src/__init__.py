@@ -1,1 +1,1 @@
-"""GPS Map-Matching & Route Reconstruction package."""
+"""PathSnap Map Matching & Route Reconstruction Package."""
